@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V16 — Engine Studio</title>
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;background:#090b0e;color:#e9edf2;
+  font-family:system-ui,sans-serif;
+  min-height:100vh;display:grid;place-items:center;padding:18px
+}
+main{width:min(1100px,100%)}
+header{display:flex;justify-content:space-between;align-items:center;margin:12px 0 20px}
+h1{font-size:30px;letter-spacing:6px;margin:0}
+h1 b{color:#e86d3f}
+.subtitle{font-size:12px;color:#8c939e;margin-top:8px}
+.tag{font-size:11px;color:#9ca7b4;letter-spacing:2px}
+.stage{
+  border:1px solid #30343a;border-radius:18px;
+  overflow:hidden;background:#15191e;box-shadow:0 25px 90px #0009
+}
+canvas{display:block;width:100%;aspect-ratio:1100/680}
+.controls{
+  display:flex;align-items:center;gap:22px;flex-wrap:wrap;
+  padding:22px;background:#11151a;border-top:1px solid #292e35
+}
+button{
+  cursor:pointer;background:#d75b31;color:white;
+  border:0;border-radius:8px;padding:14px 22px;font-weight:700
+}
+.slider{flex:1;min-width:180px}
+.slider.volume{flex:.55;min-width:120px}
+label{display:flex;justify-content:space-between;color:#99a3af;font-size:11px;margin-bottom:10px}
+input{width:100%;accent-color:#e47645}
+.rpm{min-width:110px;text-align:right}
+.rpm strong{font-size:32px;font-variant-numeric:tabular-nums}
+.rpm small{color:#939daa;font-size:10px;display:block;letter-spacing:3px}
+footer{font-size:12px;line-height:1.6;color:#77818e;margin:15px 3px}
+#error{color:#ffad86}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div>
+    <h1>V<b>16</b> / STUDIO</h1>
+    <div class="subtitle">Металлический двигатель · импульсный синтез выхлопа</div>
+  </div>
+  <div class="tag" id="state">OFFLINE</div>
+</header>
+
+<div class="stage">
+  <canvas id="view"></canvas>
+  <div class="controls">
+    <button id="ignition">▶ Запустить</button>
+    <div class="slider">
+      <label><span>ОБОРОТЫ</span><span>700 — 7500</span></label>
+      <input id="throttle" aria-label="Обороты" type="range"
+             min="700" max="7500" step="50" value="950">
+    </div>
+    <div class="slider volume">
+      <label><span>ГРОМКОСТЬ</span><span id="volText">25%</span></label>
+      <input id="volume" aria-label="Громкость" type="range"
+             min="0" max="100" value="25">
+    </div>
+    <div class="rpm"><strong id="rpm">0</strong><small>RPM</small></div>
+  </div>
+</div>
+<footer>
+  Двигатель нарисован программно в объёме — это иллюстрация, не фотография.
+  Характер звука особенно заметен в наушниках или на колонках с басом.
+  <span id="error"></span>
+</footer>
+</main>
+
+<script>
+const canvas = document.querySelector("#view");
+const c = canvas.getContext("2d");
+const throttle = document.querySelector("#throttle");
+const volume = document.querySelector("#volume");
+const button = document.querySelector("#ignition");
+
+let running = false, rpm = 0, rotation = 0;
+let ac, motor, master, previous = performance.now();
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(canvas.clientWidth * dpr);
+  canvas.height = Math.round(canvas.clientHeight * dpr);
+}
+addEventListener("resize", resize);
+resize();
+
+// Изометрическая проекция.
+// X — поперёк двигателя, Y — вдоль, Z — высота.
+function P(x,y,z){
+  return [550 + x*.90 - y*.69, 453 + x*.36 + y*.37 - z];
+}
+function path(points){
+  c.beginPath();
+  points.forEach((p,i)=>i ? c.lineTo(...p) : c.moveTo(...p));
+  c.closePath();
+}
+function poly(points, fill, stroke="#0008"){
+  path(points);c.fillStyle=fill;c.fill();
+  if(stroke){c.strokeStyle=stroke;c.lineWidth=1;c.stroke()}
+}
+function gradient(x1,y1,x2,y2,stops){
+  const g=c.createLinearGradient(x1,y1,x2,y2);
+  stops.forEach(([p,col])=>g.addColorStop(p,col));
+  return g;
+}
+function metal(points, base="#707a83", bright="#c4cdd3"){
+  const ys=points.map(p=>p[1]), xs=points.map(p=>p[0]);
+  poly(points,gradient(Math.min(...xs),Math.min(...ys),
+    Math.max(...xs),Math.max(...ys),[
+      [0,bright],[.18,base],[.45,bright],[.52,base],[1,"#303840"]
+    ]));
+}
+function box(x,y,z,w,d,h,top="#8b969e",front="#48525c",side="#303940"){
+  const a=P(x,y,z+h),b=P(x+w,y,z+h);
+  const e=P(x+w,y+d,z+h),f=P(x,y+d,z+h);
+  poly([f,e,P(x+w,y+d,z),P(x,y+d,z)],front);
+  poly([b,P(x+w,y,z),P(x+w,y+d,z),e],side);
+  if(top==="metal")metal([a,b,e,f]);
+  else poly([a,b,e,f],top);
+}
+function line3(points,color,width){
+  c.beginPath();
+  points.forEach((p,i)=>{
+    const q=P(...p);
+    i?c.lineTo(...q):c.moveTo(...q);
+  });
+  c.strokeStyle=color;c.lineWidth=width;
+  c.lineJoin="round";c.lineCap="round";c.stroke();
+}
+function tube(points,width=13){
+  line3(points,"#080c10",width+4);
+  line3(points,"#4b5257",width);
+  line3(points.map(([x,y,z])=>[x-1,y-1,z+2]),"#a0a8ac",width*.46);
+  line3(points.map(([x,y,z])=>[x-2,y-2,z+3]),"#e3e5df",width*.12);
+}
+function bolt(x,y,z){
+  const [a,b]=P(x,y,z);
+  const points=[];
+  for(let i=0;i<6;i++){
+    const t=i*Math.PI/3;
+    points.push([a+4*Math.cos(t),b+2.7*Math.sin(t)]);
+  }
+  poly(points,"#c4ccd0","#283039");
+  c.fillStyle="#414951";c.fillRect(a-1,b-1,2,2);
+}
+function label3(str,x,y,z,size,color){
+  const q=P(x,y,z);
+  c.save();c.translate(...q);
+  c.transform(.90,.36,-.69,.37,0,0);
+  c.fillStyle=color;c.font=`bold ${size}px system-ui`;
+  c.textAlign="center";c.fillText(str,0,0);c.restore();
+}
+
+function pulley(x,y,z,r,phase){
+  const center=P(x,y,z);
+  c.save();c.translate(...center);
+  c.transform(.94,.30,0,1,0,0);
+
+  c.shadowColor="#000a";c.shadowBlur=12;
+  const g=c.createRadialGradient(-r*.3,-r*.35,1,0,0,r);
+  g.addColorStop(0,"#abb7c2");
+  g.addColorStop(.5,"#59636d");
+  g.addColorStop(.76,"#20252b");
+  g.addColorStop(.85,"#788590");
+  g.addColorStop(.90,"#171c21");
+  g.addColorStop(1,"#3c444c");
+  c.fillStyle=g;c.beginPath();c.arc(0,0,r,0,Math.PI*2);c.fill();
+  c.shadowBlur=0;
+  c.rotate(phase);
+  for(let i=0;i<8;i++){
+    c.rotate(Math.PI/4);
+    c.fillStyle="#12171d";
+    c.beginPath();c.ellipse(r*.55,0,r*.16,r*.09,0,0,Math.PI*2);c.fill();
+    c.strokeStyle="#bac3cb55";c.stroke();
+  }
+  c.fillStyle="#b7bfc6";c.beginPath();c.arc(0,0,r*.20,0,7);c.fill();
+  c.fillStyle="#424b54";c.fillRect(-5,-5,10,10);
+  c.restore();
+}
+
+function draw(now){
+  c.setTransform(canvas.width/1100,0,0,canvas.height/680,0,0);
+  const bg=c.createRadialGradient(510,240,40,550,340,650);
+  bg.addColorStop(0,"#343c45");bg.addColorStop(.6,"#1a1f26");bg.addColorStop(1,"#0c1015");
+  c.fillStyle=bg;c.fillRect(0,0,1100,680);
+
+  // Мягкая студийная тень.
+  c.save();c.translate(545,540);c.scale(1,.25);
+  const shadow=c.createRadialGradient(0,0,40,0,0,420);
+  shadow.addColorStop(0,"#000c");shadow.addColorStop(1,"#0000");
+  c.fillStyle=shadow;c.fillRect(-450,-450,900,900);c.restore();
+
+  c.save();
+  const vibration=Math.min(rpm/700,1);
+  c.translate(Math.sin(now*.071)*.55*vibration,
+              Math.cos(now*.089)*.45*vibration);
+
+  // Дальние выпускные коллекторы.
+  for(let i=0;i<8;i++){
+    const y=-230+i*61;
+    tube([[-122,y,175],[-173,y,150],[-191,y+16,90],[-184,y+40,58]],12);
+  }
+  tube([[-184,-195,58],[-184,290,58],[-175,325,35]],23);
+
+  // Картер, рёбра и блок.
+  box(-100,-255,10,200,515,58,"#4b545b","#30383e","#232a30");
+  for(let k=0;k<6;k++){
+    box(-105,-257,18+k*7,210,520,3,"#5a6369","#3b444b","#343c42");
+  }
+  box(-128,-257,73,256,515,67,"metal","#626c74","#404950");
+
+  // V-образные наклонные поверхности головок.
+  for(const bank of [-1,1]){
+    const inner=bank*38,outer=bank*151;
+    const a=P(inner,-257,180),b=P(outer,-257,225);
+    const e=P(outer,257,225),f=P(inner,257,180);
+    metal([a,b,e,f],"#727e88","#b7c1c8");
+    poly([f,e,P(outer,257,148),P(inner,257,112)],"#505c65");
+  }
+
+  // Впускные каналы в развале блока.
+  for(let i=0;i<8;i++){
+    const y=-225+i*61;
+    for(const bank of [-1,1]){
+      tube([[bank*92,y,209],[bank*62,y,236],[bank*29,y,239],[0,y,226]],15);
+    }
+  }
+  box(-28,-263,225,56,527,27,"metal","#68727b","#414b54");
+  for(let i=0;i<14;i++)
+    line3([[-22,-243+i*36,253],[22,-243+i*36,253]],"#dce1e455",1);
+
+  // Крышки двух рядов цилиндров.
+  for(const bank of [-1,1]){
+    const x=bank<0?-147:60;
+    box(x,-259,224,87,524,31,"metal","#525e69","#3c4751");
+
+    // Чёрная центральная вставка, продольные рёбра.
+    box(x+18,-245,255,51,494,3,"#171f27","#0d141a","#242d35");
+    for(const dx of [8,13,74,79]){
+      line3([[x+dx,-244,257],[x+dx,247,257]],"#dce4e8",1.6);
+    }
+
+    for(let i=0;i<8;i++){
+      const y=-223+i*61;
+      bolt(x+8,y,258);bolt(x+79,y,258);
+      // Катушки зажигания.
+      box(x+29,y-10,259,29,21,9,"#303941","#182129","#10171e");
+      line3([[x+44,y,270],[x+56,y+9,268],[x+62,y+22,258]],"#090e13",3);
+    }
+    label3("V 1 6",x+43,221,261,18,"#e4e8eb");
+  }
+
+  // Ближний выпуск: отдельная труба на каждый цилиндр.
+  for(let i=0;i<8;i++){
+    const y=-225+i*61;
+    tube([[145,y,189],[181,y,169],[201,y+9,126],[202,y+32,83]],14);
+    bolt(151,y-10,193);
+  }
+  tube([[202,-205,80],[202,290,80],[190,327,46]],26);
+
+  // Передняя крышка и крепёж.
+  box(-120,260,78,240,19,119,"metal","#616c76","#3a454e");
+  for(const x of [-105,105])
+    for(const z of [92,176])bolt(x,281,z);
+
+  // Масляный фильтр и навесные агрегаты.
+  box(-156,175,74,40,70,55,"#242d37","#151f29","#0c131b");
+  box(108,200,98,50,65,58,"metal","#63707a","#3b4752");
+  for(let i=0;i<5;i++)
+    line3([[112+i*9,268,109],[112+i*9,268,145]],"#202a33",3);
+
+  // Ремень и вращающиеся шкивы.
+  line3([[-78,287,161],[20,287,68],[119,287,128],
+         [112,287,169],[-78,287,190],[-78,287,161]],"#090d11",11);
+  line3([[-78,288,161],[20,288,68],[119,288,128],
+         [112,288,169],[-78,288,190],[-78,288,161]],"#46505a",1);
+
+  pulley(18,294,100,49,rotation);
+  pulley(-78,291,178,29,-rotation*1.4);
+  pulley(113,292,149,32,rotation*1.7);
+
+  // Передний впускной патрубок.
+  tube([[0,260,239],[0,291,240],[-16,319,226]],34);
+
+  c.restore();
+
+  c.fillStyle="#c2cbd6";c.font="11px system-ui";c.textAlign="left";
+  c.fillText("V16  /  NATURALLY ASPIRATED",35,40);
+  c.fillStyle="#7c8896";c.fillText("ENGINE STUDIO • PROCEDURAL RENDER",35,61);
+
+  c.textAlign="right";c.fillStyle=running?"#e99163":"#708090";
+  c.fillText(running?"● ENGINE RUNNING":"● ENGINE STOPPED",1065,40);
+
+  // Небольшой индикатор оборотов.
+  for(let i=0;i<48;i++){
+    c.fillStyle=i<rpm/7500*48?(i>39?"#e36443":"#b1bac2"):"#313944";
+    c.fillRect(36+i*5,626,3,14);
+  }
+  c.textAlign="left";c.fillStyle="#6f7d8c";
+  c.fillText("IDLE",36,658);
+  c.fillText("REDLINE",231,658);
+}
+
+// Импульсный синтез: 16 вспышек на два оборота.
+// Каждая вспышка возбуждает резонансы выхлопа и короткий шумовой выброс.
+const processorCode = `
+class V16Processor extends AudioWorkletProcessor {
+  constructor(){
+    super();
+    this.target=0;this.rpm=0;this.phase=0;this.time=0;this.index=0;
+    this.env=0;this.pop=0;this.air=0;this.dc=0;
+    this.r1=0;this.r2=0;this.s1=0;this.s2=0;
+    this.strength=[1,.94,1.04,.98,.96,1.03,.92,1.02,
+                   .97,1.05,.95,1.01,.93,1.04,.99,.96];
+    this.port.onmessage=e=>{this.target=e.data.rpm};
+    this.a=Math.exp(-1/(sampleRate*.028));
+    this.b=Math.exp(-1/(sampleRate*.055));
+    this.co1=2*this.a*Math.cos(2*Math.PI*76/sampleRate);
+    this.co2=2*this.b*Math.cos(2*Math.PI*151/sampleRate);
+    this.decay=Math.exp(-1/(sampleRate*.0035));
+    this.popDecay=Math.exp(-1/(sampleRate*.0008));
+  }
+  process(inputs,outputs){
+    const out=outputs[0];
+    const left=out[0],right=out[1]||out[0];
+    for(let i=0;i<left.length;i++){
+      this.rpm+=(this.target-this.rpm)*.001;
+      this.time+=1/sampleRate;
+      const on=Math.min(this.rpm/500,1);
+      const load=Math.min(this.rpm/7500,1);
+      const wobble=1+
+        .010*Math.sin(this.time*13.1)+
+        .006*Math.sin(this.time*21.7);
+      this.phase+=Math.max(0,this.rpm)*8/60/sampleRate*wobble;
+      let impulse=0;
+      if(this.phase>=1){
+        this.phase-=Math.floor(this.phase);
+        impulse=this.strength[this.index++%16]*(.93+Math.random()*.14)*on;
+        this.env+=impulse;
+        this.pop+=impulse;
+      }
+      this.env*=this.decay;
+      this.pop*=this.popDecay;
+      const noise=Math.random()*2-1;
+      this.air+=(noise-this.air)*.12;
+
+      const r=this.co1*this.r1-this.a*this.a*this.r2+impulse*.075;
+      this.r2=this.r1;this.r1=r;
+      const s=this.co2*this.s1-this.b*this.b*this.s2+impulse*.042;
+      this.s2=this.s1;this.s1=s;
+
+      // Высокочастотная механика привязана к вращению вала.
+      const crank=this.phase/8+this.index/8;
+      const mechanical=(
+        Math.sin(crank*2*Math.PI*2)+
+        .3*Math.sin(crank*2*Math.PI*5)
+      )*.017*on;
+
+      let v=r*.40+s*.24+
+        this.pop*.30+
+        this.air*this.env*(.30+load*.22)+
+        this.air*(.018+load*.045)*on+
+        mechanical;
+
+      // Удаление постоянной составляющей и мягкая сатурация.
+      this.dc+=(v-this.dc)*.002;
+      v=Math.tanh((v-this.dc)*1.8)*.60;
+      left[i]=v;
+      right[i]=v;
+    }
+    return true;
+  }
+}
+registerProcessor("v16-combustion",V16Processor);
+`;
+
+async function initAudio(){
+  if(motor){await ac.resume();return}
+  if(!ac)ac=new (window.AudioContext||window.webkitAudioContext)();
+  await ac.resume();
+  if(!ac.audioWorklet)
+    throw new Error("AudioWorklet недоступен");
+
+  const url=URL.createObjectURL(new Blob([processorCode],{type:"text/javascript"}));
+  try{await ac.audioWorklet.addModule(url)}
+  finally{URL.revokeObjectURL(url)}
+
+  motor=new AudioWorkletNode(ac,"v16-combustion",{
+    numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]
+  });
+
+  const hp=ac.createBiquadFilter();
+  hp.type="highpass";hp.frequency.value=32;
+
+  const body=ac.createBiquadFilter();
+  body.type="peaking";body.frequency.value=110;
+  body.Q.value=.7;body.gain.value=4;
+
+  const exhaust=ac.createBiquadFilter();
+  exhaust.type="lowpass";exhaust.frequency.value=3200;exhaust.Q.value=.5;
+
+  const compressor=ac.createDynamicsCompressor();
+  compressor.threshold.value=-15;
+  compressor.knee.value=14;
+  compressor.ratio.value=4;
+  compressor.attack.value=.005;
+  compressor.release.value=.12;
+
+  master=ac.createGain();
+  master.gain.value=Number(volume.value)/100*.75;
+
+  motor.connect(hp).connect(body).connect(exhaust).connect(compressor);
+  compressor.connect(master);
+
+  // Очень короткое отражение: ощущение пространства, не длинное эхо.
+  const delay=ac.createDelay();
+  delay.delayTime.value=.043;
+  const wet=ac.createGain();wet.gain.value=.13;
+  compressor.connect(delay).connect(wet).connect(master);
+  master.connect(ac.destination);
+}
+
+button.onclick=async()=>{
+  button.disabled=true;
+  if(!running){
+    try{
+      await initAudio();
+      document.querySelector("#error").textContent="";
+    }catch(e){
+      document.querySelector("#error").textContent=
+        " Звук недоступен. Попробуй актуальный Chrome/Edge или открой страницу через localhost.";
+    }
+  }
+  running=!running;
+  button.textContent=running?"■ Заглушить":"▶ Запустить";
+  document.querySelector("#state").textContent=running?"IGNITION ON":"OFFLINE";
+  button.disabled=false;
+};
+
+volume.oninput=()=>{
+  document.querySelector("#volText").textContent=volume.value+"%";
+  if(master)master.gain.setTargetAtTime(Number(volume.value)/100*.75,ac.currentTime,.05);
+};
+
+let sendTime=0;
+function frame(now){
+  const dt=Math.min((now-previous)/1000,.05);previous=now;
+  const target=running?Number(throttle.value):0;
+  rpm+=(target-rpm)*(1-Math.exp(-dt*(running?2.1:1.5)));
+  if(!running&&rpm<2)rpm=0;
+
+  rotation+=rpm/60*Math.PI*2*dt;
+  if(motor&&now-sendTime>35){
+    motor.port.postMessage({rpm});
+    sendTime=now;
+  }
+  document.querySelector("#rpm").textContent=Math.round(rpm).toLocaleString("ru-RU");
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
